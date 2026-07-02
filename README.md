@@ -159,7 +159,7 @@ Optional extension surface:
 The default workspace config in this repository currently enables:
 
 - main agent id `agnobot-main`
-- model provider `google` with `gemini-2.5-flash`
+- model provider `openai` with `gpt-4.1-mini`
 - local database mode by default
 - hybrid knowledge search
 - agentic memory
@@ -238,6 +238,7 @@ Key runtime behaviors:
 - tenant updates can persist workspace config changes
 - tenant runs scope `user_id`, `session_id`, metadata, and knowledge filters
 - tenant knowledge retrieval uses isolated filters for vector search
+- BYOK model credentials (`model.api_key`, `model.aws_access_key_id`, `model.aws_secret_access_key` and the same fields under `fallback`) are encrypted at rest (AES-256-GCM, `enc:v1:` values) in the `openagno_tenants` table when `CHANNEL_SECRETS_KEY` is configured, and decrypted transparently when the tenant is loaded. See `openagno/core/model_secrets.py`
 
 This is the public multi-tenant contract any external control plane can consume.
 
@@ -373,6 +374,8 @@ npm run broken-links
 Spanish pages are published under `docs/es/`.
 
 ## Release and validation
+
+Latest validation (July 2, 2026): `pytest -q` passes with 153 tests and `ruff check` is clean, including the new at-rest encryption coverage in `tests/test_model_secrets.py`.
 
 Local verification used for the current `v1.3.0` closeout:
 

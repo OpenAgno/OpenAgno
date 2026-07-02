@@ -5,7 +5,7 @@
 | Provider (config.yaml) | Import Agno | Modelos recomendados (marzo 2026) |
 |------------------------|-------------|----------------------------------|
 | `google` | `agno.models.google.Gemini` | `gemini-2.5-flash` (default), `gemini-2.5-pro`, `gemini-3-flash-preview` |
-| `openai` | `agno.models.openai.OpenAIChat` | `gpt-4o`, `gpt-4o-mini`, `o1`, `o1-mini` |
+| `openai` | `agno.models.openai.OpenAIChat` | `gpt-4.1-mini`, `gpt-5-mini`, `gpt-4o-mini` |
 | `anthropic` | `agno.models.anthropic.Claude` | `claude-sonnet-4-6`, `claude-haiku-3-5` |
 | `aws_bedrock_claude` | `agno.models.aws.Claude` | `us.anthropic.claude-sonnet-4-6-v1:0` |
 | `aws_bedrock` | `agno.models.aws.AwsBedrock` | `amazon.nova-pro-v1:0` |
@@ -45,8 +45,8 @@ agent:
   name: "Nombre del Agente"
   id: "nombre-agente"  # sin espacios, lowercase
   model:
-    provider: google  # DEBE ser uno de la tabla de arriba
-    id: gemini-2.5-flash
+    provider: openai  # DEBE ser uno de la tabla de arriba
+    id: gpt-4.1-mini
   instructions:
     - "Instrucciones específicas del agente."
   tools:

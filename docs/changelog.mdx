@@ -8,6 +8,17 @@ description: Historial resumido de versiones públicas y milestones del producto
 Trabajo acumulado en `main` desde el corte de `v1.3.0`. Estos cambios estaran
 empaquetados en la proxima release.
 
+- `openagno/core/model_secrets.py`: cifrado at-rest AES-256-GCM para
+  credenciales BYOK de modelos (`model.api_key`,
+  `model.aws_access_key_id`, `model.aws_secret_access_key` y los mismos
+  campos en `fallback`) dentro de `openagno_tenants.workspace_config`.
+  Los valores se guardan como `enc:v1:<nonce>:<cipher>` usando
+  `CHANNEL_SECRETS_KEY` y `TenantStore` los descifra al leer. Sin la
+  clave configurada el comportamiento es no-op (compatible con
+  despliegues single-tenant que usan el `.env` del servidor).
+- Workspace por defecto: modelo principal actualizado de
+  `google/gemini-2.5-flash` a `openai/gpt-4.1-mini` en `config.yaml`,
+  sub-agente de investigacion y team de ejemplo.
 - `openagno/channels/whatsapp_cloud.py`: nuevo router multi-tenant
   `GET/POST /whatsapp-cloud/{tenant_id}/webhook` que verifica firma
   `X-Hub-Signature-256` por tenant, descifra credenciales con

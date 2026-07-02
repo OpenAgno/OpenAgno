@@ -11,6 +11,11 @@ from agno.knowledge.knowledge import Knowledge
 from sqlalchemy import JSON, Boolean, Column, DateTime, Integer, MetaData, String, Table, create_engine, select
 from sqlalchemy.pool import NullPool
 
+from openagno.core.model_secrets import (
+	decrypt_workspace_config_secrets,
+	encrypt_workspace_config_secrets,
+)
+
 
 DEFAULT_TENANT = "default"
 
@@ -111,7 +116,7 @@ class TenantStore:
 			name=row["name"],
 			slug=row["slug"],
 			plan=row["plan"],
-			workspace_config=row["workspace_config"] or {},
+			workspace_config=decrypt_workspace_config_secrets(row["workspace_config"] or {}),
 			created_at=row["created_at"],
 			active=bool(row["active"]),
 			max_agents=int(row["max_agents"]),
@@ -162,8 +167,10 @@ class TenantStore:
 		if self.get_tenant(tenant.slug) is not None:
 			raise ValueError(f"Tenant slug already exists: {tenant.slug}")
 
+		row = tenant.to_dict(serialize=False)
+		row["workspace_config"] = encrypt_workspace_config_secrets(row["workspace_config"])
 		with self.engine.begin() as conn:
-			conn.execute(tenant_table.insert().values(**tenant.to_dict(serialize=False)))
+			conn.execute(tenant_table.insert().values(**row))
 		return tenant
 
 	def update_tenant(self, identifier: str, **updates: Any) -> Tenant:
@@ -182,6 +189,11 @@ class TenantStore:
 		):
 			if field in updates and updates[field] is not None:
 				payload[field] = updates[field]
+
+		if "workspace_config" in payload:
+			payload["workspace_config"] = encrypt_workspace_config_secrets(
+				payload["workspace_config"]
+			)
 
 		if "slug" in updates and updates["slug"]:
 			new_slug = slugify_tenant(updates["slug"])

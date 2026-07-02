@@ -4,8 +4,8 @@ agent:
   description: Asistente IA multimodal con workspace declarativo
 
 model:
-  provider: google
-  id: gemini-2.5-flash
+  provider: openai
+  id: gpt-4.1-mini
 
 fallback:
   enabled: false

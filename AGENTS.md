@@ -70,7 +70,8 @@ The CLI wizard (`openagno init`) interactively collects `.env` values. Non-inter
 - `loader.py`: resolves a workspace directory into an Agno agent bundle (`main_agent`, `sub_agents`, `teams`, `db`, `knowledge`, `config`). `load_workspace_from_dir(path)` is the canonical entry point; `load_workspace()` is a legacy wrapper
 - `openagno/cli.py`: CLI bootstrap (maps to subcommands in `openagno/commands/`)
 - `openagno/commands/`: packaged CLI commands (`init`, `start`, `stop`, `status`, `logs`, `validate`, `create`, `add`, `templates`, `deploy`)
-- `openagno/core/tenant.py`: `Tenant` dataclass, `TenantStore`, `slugify_tenant`, `normalize_tenant_id`, knowledge-scoping helpers
+- `openagno/core/tenant.py`: `Tenant` dataclass, `TenantStore`, `slugify_tenant`, `normalize_tenant_id`, knowledge-scoping helpers. The store encrypts BYOK model credentials before persisting `workspace_config` and decrypts them on read
+- `openagno/core/model_secrets.py`: in-place AES-256-GCM encryption (`enc:v1:` values) for `model`/`fallback` credentials inside `workspace_config`, keyed by `CHANNEL_SECRETS_KEY`; degrades to no-op when the key is not configured
 - `openagno/core/tenant_loader.py`: LRU cache of per-tenant workspace bundles. The gateway injects the default workspace as tenant `default` to avoid duplicate model objects
 - `openagno/core/tenant_middleware.py`: resolves `X-Tenant-ID` (or query/path) for tenant-aware routes
 - `openagno/core/workspace_store.py`: provisions tenant workspaces from templates and writes `config.yaml` + derived Markdown files
@@ -151,6 +152,7 @@ BYOK (bring your own key) per tenant:
 - When a tenant provides its own API key (customer), Agno receives it as a kwarg
 - When a tenant does not provide credentials (operator/default), Agno falls back to `os.environ` (the server-level `.env`)
 - `GET /admin/health?tenant_slug=X` redacts credentials: returns only `provider`, `id`, `aws_region`
+- At rest, BYOK credentials in `public.openagno_tenants.workspace_config` are AES-256-GCM encrypted as `enc:v1:<nonce_b64>:<cipher_b64>` values (see `openagno/core/model_secrets.py`); `TenantStore` decrypts on read so the loader keeps receiving plaintext kwargs. Requires `CHANNEL_SECRETS_KEY`
 
 Do not widen this contract casually. In particular:
 
@@ -165,6 +167,7 @@ Do not widen this contract casually. In particular:
 - `WHATSAPP_SKIP_SIGNATURE_VALIDATION=true` exists for local development only; never set it in production
 - Avoid destructive tenant or workspace cleanup unless the user clearly asked for it
 - Multi-tenant Cloud API credentials (`access_token`, `verify_token`, `app_secret`) are AES-256-GCM encrypted in Supabase. The master key `CHANNEL_SECRETS_KEY` must be shared with whatever system populates the table; rotating it requires re-encrypting existing rows
+- BYOK model credentials inside `openagno_tenants.workspace_config` are also encrypted with `CHANNEL_SECRETS_KEY` (`openagno/core/model_secrets.py`). Rotating the key requires re-encrypting those values too. Workspace files on the runtime host disk stay plaintext by design (the process needs them to call providers)
 
 ## Agent workflow
 

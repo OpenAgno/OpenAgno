@@ -6,8 +6,8 @@ teams:
       - agnobot-main
       - research-agent
     model:
-      provider: google
-      id: gemini-2.5-flash
+      provider: openai
+      id: gpt-4.1-mini
     instructions:
       - Coordina entre el agente principal y el agente de investigacion.
       - Usa el agente de investigacion para busquedas web profundas.
