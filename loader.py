@@ -401,9 +401,14 @@ def build_tools(
 				try:
 					from agno.tools.github import GithubTools
 					tools.append(GithubTools())
-					logger.info("GithubTools activado — requiere GITHUB_TOKEN")
+					logger.info("GithubTools activado — usa GITHUB_ACCESS_TOKEN del entorno")
 				except ImportError:
 					logger.warning("GithubTools no disponible — instalar PyGithub>=2.0")
+				except ValueError as e:
+					# Sin GITHUB_ACCESS_TOKEN configurado GithubTools lanza ValueError.
+					# No debe tumbar la carga del workspace: se omite el tool y el
+					# agente queda funcional hasta que el operador ponga la key.
+					logger.warning(f"GithubTools omitido — {e} (definir GITHUB_ACCESS_TOKEN y reiniciar)")
 			case "yfinance":
 				try:
 					from agno.tools.yfinance import YFinanceTools
