@@ -27,6 +27,8 @@ import hmac
 import json
 import os
 import tempfile
+import threading
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -34,7 +36,7 @@ import httpx
 import psycopg
 from agno.utils.log import logger
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from fastapi import APIRouter, FastAPI, HTTPException, Query, Request, Response
+from fastapi import APIRouter, BackgroundTasks, FastAPI, HTTPException, Query, Request, Response
 
 from openagno.core.tenant import DEFAULT_TENANT, normalize_tenant_id
 
@@ -372,6 +374,37 @@ def _safe_provider_error_reply() -> str:
 	)
 
 
+# Deduplicacion de mensajes entrantes. Meta reintenta la entrega del webhook si
+# no recibe HTTP 200 en pocos segundos; como el agente puede tardar decenas de
+# segundos, esos reintentos entregan el MISMO mensaje (mismo `id`) y, sin este
+# guard, cada reintento dispararia otra ejecucion del agente y otra respuesta
+# duplicada al usuario. Guardamos los ids ya vistos en memoria con TTL. Un solo
+# proceso uvicorn atiende el webhook, asi que un dict en memoria es suficiente.
+_PROCESSED_MESSAGE_TTL_SECONDS = 900
+_processed_messages: dict[str, float] = {}
+_processed_messages_lock = threading.Lock()
+
+
+def _claim_message(msg_id: str) -> bool:
+	"""Marca un mensaje como en proceso. Devuelve True si es nuevo (hay que
+	procesarlo), False si ya fue visto dentro del TTL (reintento a descartar).
+
+	Mensajes sin id no se pueden deduplicar, asi que siempre se procesan.
+	"""
+	if not msg_id:
+		return True
+	now = time.time()
+	with _processed_messages_lock:
+		expired = [k for k, ts in _processed_messages.items() if now - ts > _PROCESSED_MESSAGE_TTL_SECONDS]
+		for k in expired:
+			del _processed_messages[k]
+		seen_at = _processed_messages.get(msg_id)
+		if seen_at is not None and now - seen_at <= _PROCESSED_MESSAGE_TTL_SECONDS:
+			return False
+		_processed_messages[msg_id] = now
+		return True
+
+
 def create_router(*, get_tenant_loader: Any) -> APIRouter:
 	"""Construye el router `/whatsapp-cloud/*` inyectando el TenantLoader.
 
@@ -399,35 +432,11 @@ def create_router(*, get_tenant_loader: Any) -> APIRouter:
 		# Meta espera el challenge como texto plano (numerico).
 		return Response(content=challenge, media_type="text/plain")
 
-	@router.post("/whatsapp-cloud/{tenant_id}/webhook")
-	async def receive_webhook(tenant_id: str, request: Request):
-		try:
-			cfg = load_cloud_config(tenant_id)
-		except ConfigNotFoundError:
-			raise HTTPException(status_code=404, detail="tenant_not_configured")
-
-		body = await request.body()
-		if cfg.app_secret:
-			signature = request.headers.get("x-hub-signature-256")
-			if not verify_signature(cfg.app_secret, body, signature):
-				_touch_column(tenant_id, "last_event_at", error="invalid_signature")
-				raise HTTPException(status_code=401, detail="invalid_signature")
-
-		try:
-			payload = json.loads(body or b"{}")
-		except json.JSONDecodeError:
-			raise HTTPException(status_code=400, detail="invalid_json")
-
-		if payload.get("object") != "whatsapp_business_account":
-			# Meta envia el webhook generico compartido; ignoramos otros objetos.
-			_touch_column(tenant_id, "last_event_at")
-			return {"status": "ignored_non_wa"}
-
-		messages = _extract_messages(payload)
-		if not messages:
-			_touch_column(tenant_id, "last_event_at")
-			return {"status": "no_messages"}
-
+	async def _process_messages(
+		cfg: WhatsAppCloudConfig, tenant_id: str, messages: list[dict[str, Any]]
+	) -> None:
+		"""Procesa mensajes y responde por Graph API. Corre en background para no
+		bloquear el 200 del webhook (evita reintentos de Meta por timeout)."""
 		tenant_loader = get_tenant_loader()
 		runtime_slug = normalize_tenant_id(cfg.runtime_slug)
 
@@ -436,7 +445,7 @@ def create_router(*, get_tenant_loader: Any) -> APIRouter:
 		except LookupError as exc:
 			logger.error(f"[{runtime_slug}] whatsapp-cloud: no se pudo cargar workspace: {exc}")
 			_touch_column(tenant_id, "last_event_at", error=f"workspace_missing:{exc}")
-			raise HTTPException(status_code=500, detail="tenant_workspace_missing")
+			return
 
 		from agno.media import Audio as AgnoAudio, Image as AgnoImage
 		from openagno.core.model_capabilities import get_model_capabilities
@@ -444,7 +453,6 @@ def create_router(*, get_tenant_loader: Any) -> APIRouter:
 		agent = bundle["main_agent"]
 		tenant_model_cfg = bundle.get("config", {}).get("model", {}) or {}
 		tenant_caps = get_model_capabilities(tenant_model_cfg.get("id"))
-		responses_sent = 0
 		last_send_error: str | None = None
 
 		for message in messages:
@@ -527,7 +535,6 @@ def create_router(*, get_tenant_loader: Any) -> APIRouter:
 				continue
 			try:
 				await send_text(cfg, from_jid, reply_text)
-				responses_sent += 1
 				_touch_column(tenant_id, "last_send_at")
 			except Exception as exc:  # noqa: BLE001
 				logger.error(
@@ -536,11 +543,58 @@ def create_router(*, get_tenant_loader: Any) -> APIRouter:
 				last_send_error = f"send_failed:{exc}"
 
 		_touch_column(tenant_id, "last_event_at", error=last_send_error)
+
+	@router.post("/whatsapp-cloud/{tenant_id}/webhook")
+	async def receive_webhook(
+		tenant_id: str, request: Request, background_tasks: BackgroundTasks
+	):
+		try:
+			cfg = load_cloud_config(tenant_id)
+		except ConfigNotFoundError:
+			raise HTTPException(status_code=404, detail="tenant_not_configured")
+
+		body = await request.body()
+		if cfg.app_secret:
+			signature = request.headers.get("x-hub-signature-256")
+			if not verify_signature(cfg.app_secret, body, signature):
+				_touch_column(tenant_id, "last_event_at", error="invalid_signature")
+				raise HTTPException(status_code=401, detail="invalid_signature")
+
+		try:
+			payload = json.loads(body or b"{}")
+		except json.JSONDecodeError:
+			raise HTTPException(status_code=400, detail="invalid_json")
+
+		if payload.get("object") != "whatsapp_business_account":
+			# Meta envia el webhook generico compartido; ignoramos otros objetos.
+			_touch_column(tenant_id, "last_event_at")
+			return {"status": "ignored_non_wa"}
+
+		messages = _extract_messages(payload)
+		if not messages:
+			_touch_column(tenant_id, "last_event_at")
+			return {"status": "no_messages"}
+
+		# Descartar reintentos de Meta: solo procesamos ids no vistos. Esto evita
+		# respuestas duplicadas cuando el agente tarda y Meta reenvia el webhook.
+		fresh = [m for m in messages if _claim_message(m.get("id", ""))]
+		duplicates = len(messages) - len(fresh)
+		if duplicates:
+			logger.info(
+				f"[{normalize_tenant_id(cfg.runtime_slug)}] whatsapp-cloud: "
+				f"{duplicates} mensaje(s) duplicado(s) ignorado(s) (reintento de Meta)"
+			)
+
+		if fresh:
+			# Responder 200 de inmediato y procesar en background para que Meta no
+			# reintente por timeout mientras el agente piensa.
+			background_tasks.add_task(_process_messages, cfg, tenant_id, fresh)
+
 		return {
-			"status": "ok",
+			"status": "accepted",
 			"received": len(messages),
-			"sent": responses_sent,
-			"last_error": last_send_error,
+			"queued": len(fresh),
+			"duplicates": duplicates,
 		}
 
 	return router

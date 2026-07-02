@@ -351,6 +351,47 @@ def test_webhook_post_no_app_secret_accepts_any_signature():
 	assert resp.json()["status"] == "no_messages"
 
 
+def test_webhook_dedupes_meta_retries_of_same_message_id():
+	row = _build_row(app_secret=None, runtime_slug="tenant-api")
+	loader = _FakeTenantLoader()
+	sent: list[tuple[str, str]] = []
+
+	async def _fake_send_text(_cfg, to: str, text: str):
+		sent.append((to, text))
+		return {"messages": [{"id": "wamid.sent"}]}
+
+	body = _wa_body([
+		{"id": "dup-1", "from": "5491111", "type": "text", "text": {"body": "hola"}},
+	])
+	with (
+		_patch_db(row),
+		patch.object(wc, "_touch_column", lambda *_a, **_k: None),
+		patch.object(wc, "send_text", _fake_send_text),
+	):
+		# Aislar el estado global de dedup para este test.
+		wc._processed_messages.clear()
+		app = _build_app(row, tenant_loader=loader)
+		client = TestClient(app)
+		first = client.post(
+			"/whatsapp-cloud/11111111-1111-1111-1111-111111111111/webhook",
+			content=body,
+			headers={"content-type": "application/json"},
+		)
+		second = client.post(
+			"/whatsapp-cloud/11111111-1111-1111-1111-111111111111/webhook",
+			content=body,
+			headers={"content-type": "application/json"},
+		)
+
+	assert first.status_code == 200
+	assert first.json()["queued"] == 1
+	# El reintento de Meta con el mismo id no debe volver a ejecutar al agente.
+	assert second.json()["queued"] == 0
+	assert second.json()["duplicates"] == 1
+	assert len(loader.agent.calls) == 1
+	assert sent == [("5491111", "respuesta del agente")]
+
+
 def test_webhook_post_text_runs_tenant_agent_and_sends_reply():
 	row = _build_row(app_secret=None, runtime_slug="tenant-api")
 	loader = _FakeTenantLoader()
@@ -365,6 +406,7 @@ def test_webhook_post_text_runs_tenant_agent_and_sends_reply():
 		patch.object(wc, "_touch_column", lambda *_a, **_k: None),
 		patch.object(wc, "send_text", _fake_send_text),
 	):
+		wc._processed_messages.clear()
 		app = _build_app(row, tenant_loader=loader)
 		client = TestClient(app)
 		resp = client.post(
@@ -376,7 +418,7 @@ def test_webhook_post_text_runs_tenant_agent_and_sends_reply():
 		)
 
 	assert resp.status_code == 200
-	assert resp.json()["sent"] == 1
+	assert resp.json()["queued"] == 1
 	assert loader.agent.calls == [
 		(
 			"hola",
