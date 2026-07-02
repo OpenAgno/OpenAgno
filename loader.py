@@ -400,8 +400,31 @@ def build_tools(
 			case "github":
 				try:
 					from agno.tools.github import GithubTools
-					tools.append(GithubTools())
-					logger.info("GithubTools activado — usa GITHUB_ACCESS_TOKEN del entorno")
+					# El toolkit completo expone ~50 funciones y satura el limite de
+					# 128 tools por request de OpenAI cuando convive con MCP servers
+					# (ej. Linear) y WorkspaceTools. Por defecto exponemos el nucleo
+					# de lectura/busqueda + issues/PRs; `config.include_tools` en
+					# tools.yaml permite ampliar la lista por tenant.
+					default_github_tools = [
+						"list_repositories",
+						"get_repository",
+						"search_repositories",
+						"search_code",
+						"get_file_content",
+						"get_directory_content",
+						"list_branches",
+						"list_issues",
+						"get_issue",
+						"create_issue",
+						"get_pull_requests",
+						"get_pull_request",
+						"search_issues_and_prs",
+					]
+					include_tools = config.get("include_tools") or default_github_tools
+					tools.append(GithubTools(include_tools=include_tools))
+					logger.info(
+						f"GithubTools activado ({len(include_tools)} funciones) — usa GITHUB_ACCESS_TOKEN del entorno"
+					)
 				except ImportError:
 					logger.warning("GithubTools no disponible — instalar PyGithub>=2.0")
 				except ValueError as e:
@@ -477,7 +500,17 @@ def build_mcp_tools(mcp_config: dict[str, Any]) -> list[MCPTools]:
 						server_params = SSEClientParams(url=url, headers=headers or None)
 					else:
 						server_params = StreamableHTTPClientParams(url=url, headers=headers or None)
-					mcp_tools.append(MCPTools(transport=transport, server_params=server_params))
+					# refresh_connection=True: los bundles de tenant se cargan dentro
+					# de una request HTTP y la sesion MCP queda atada al task scope de
+					# esa request; sin refresh, el siguiente run falla con "Cancelled
+					# via cancel scope". Con refresh cada run reconecta limpio.
+					mcp_tools.append(
+						MCPTools(
+							transport=transport,
+							server_params=server_params,
+							refresh_connection=True,
+						)
+					)
 					logger.info(f"MCP '{name}' ({transport}): {url}")
 				except Exception as e:
 					logger.warning(f"MCP '{name}' fallo al inicializar: {e}")

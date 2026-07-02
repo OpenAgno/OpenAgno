@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -423,12 +424,19 @@ def create_tenant_router(
 		metadata.setdefault("tenant_id", tenant.id)
 		metadata.setdefault("tenant_slug", tenant.slug)
 
-		response = await agent.arun(
-			payload.message,
-			user_id=scope_identity(tenant.slug, payload.user_id, fallback="user"),
-			session_id=scope_identity(tenant.slug, payload.session_id, fallback="session"),
-			knowledge_filters=knowledge_filters,
-			metadata=metadata,
+		# El run corre en un task propio: los MCP streamable-http abren cancel
+		# scopes de anyio que deben entrar y salir en el MISMO task; si viven en
+		# el task de la request (anidado en los task groups de los middlewares de
+		# Starlette) el scope se corrompe y el endpoint muere cancelado sin
+		# respuesta ("No response returned").
+		response = await asyncio.create_task(
+			agent.arun(
+				payload.message,
+				user_id=scope_identity(tenant.slug, payload.user_id, fallback="user"),
+				session_id=scope_identity(tenant.slug, payload.session_id, fallback="session"),
+				knowledge_filters=knowledge_filters,
+				metadata=metadata,
+			)
 		)
 		return {
 			"tenant": tenant.to_dict(),

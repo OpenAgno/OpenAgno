@@ -36,7 +36,7 @@ import httpx
 import psycopg
 from agno.utils.log import logger
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from fastapi import APIRouter, BackgroundTasks, FastAPI, HTTPException, Query, Request, Response
+from fastapi import APIRouter, FastAPI, HTTPException, Query, Request, Response
 
 from openagno.core.tenant import DEFAULT_TENANT, normalize_tenant_id
 
@@ -384,6 +384,10 @@ _PROCESSED_MESSAGE_TTL_SECONDS = 900
 _processed_messages: dict[str, float] = {}
 _processed_messages_lock = threading.Lock()
 
+# Referencias fuertes a los tasks de procesamiento en curso para que el
+# recolector de basura no los cancele a mitad de ejecucion.
+_background_tasks: set[Any] = set()
+
 
 def _claim_message(msg_id: str) -> bool:
 	"""Marca un mensaje como en proceso. Devuelve True si es nuevo (hay que
@@ -524,6 +528,15 @@ def create_router(*, get_tenant_loader: Any) -> APIRouter:
 			except Exception as exc:  # noqa: BLE001
 				logger.error(f"[{runtime_slug}] whatsapp-cloud: agente fallo: {exc}")
 				last_send_error = f"agent_error:{exc}"
+				# Nunca dejar al usuario en silencio: enviar una respuesta segura
+				# (sin detalles internos) para que sepa que algo fallo.
+				try:
+					await send_text(cfg, from_jid, _safe_provider_error_reply())
+					_touch_column(tenant_id, "last_send_at")
+				except Exception as send_exc:  # noqa: BLE001
+					logger.error(
+						f"[{runtime_slug}] whatsapp-cloud: fallo el aviso de error a {from_jid}: {send_exc}"
+					)
 				continue
 			if reply_text and _is_raw_provider_error(reply_text):
 				logger.error(
@@ -545,9 +558,7 @@ def create_router(*, get_tenant_loader: Any) -> APIRouter:
 		_touch_column(tenant_id, "last_event_at", error=last_send_error)
 
 	@router.post("/whatsapp-cloud/{tenant_id}/webhook")
-	async def receive_webhook(
-		tenant_id: str, request: Request, background_tasks: BackgroundTasks
-	):
+	async def receive_webhook(tenant_id: str, request: Request):
 		try:
 			cfg = load_cloud_config(tenant_id)
 		except ConfigNotFoundError:
@@ -586,9 +597,14 @@ def create_router(*, get_tenant_loader: Any) -> APIRouter:
 			)
 
 		if fresh:
-			# Responder 200 de inmediato y procesar en background para que Meta no
-			# reintente por timeout mientras el agente piensa.
-			background_tasks.add_task(_process_messages, cfg, tenant_id, fresh)
+			# Responder 200 de inmediato y procesar en un task raiz del event loop,
+			# desacoplado del ciclo de la request. No usamos BackgroundTasks de
+			# Starlette porque corre dentro de los task groups/cancel scopes de los
+			# middlewares y los MCP streamable-http fallan con "Cancelled via
+			# cancel scope" al iniciarse ahi.
+			task = asyncio.create_task(_process_messages(cfg, tenant_id, fresh))
+			_background_tasks.add(task)
+			task.add_done_callback(_background_tasks.discard)
 
 		return {
 			"status": "accepted",
