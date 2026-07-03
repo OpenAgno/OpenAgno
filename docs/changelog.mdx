@@ -27,6 +27,16 @@ empaquetados en la proxima release.
   propio tenant. Se monta cuando la env `CHANNEL_SECRETS_KEY` esta
   presente; si falta, el runtime sigue sirviendo el `/whatsapp/webhook`
   single-tenant de Agno y emite un log claro en el arranque.
+- `openagno/channels/whatsapp_cloud.py`: hardening critico del envio
+  multi-tenant WhatsApp Cloud API validado en produccion el 3 de julio
+  de 2026. El webhook ahora extrae texto de `RunOutput` usando
+  `get_content_as_string()`, cae a `messages` y `events` cuando
+  `content` viene vacio, nunca salta una respuesta vacia sin log ni
+  aviso al usuario, y desacopla el POST saliente a Graph API en una
+  task propia con referencia fuerte, timeout y logs `Meta acepto`.
+  Esto corrige el incidente donde el agente terminaba correctamente
+  pero el usuario no recibia nada por WhatsApp y `last_send_at` quedaba
+  congelado.
 - `bridges/whatsapp-qr/index.js`: upgrade de Baileys `6.17.16` a
   `7.0.0-rc.9` para resolver el bug `stream:error type=replaced` que
   disparaba loop infinito de QR tras el primer mensaje. Incluye

@@ -73,6 +73,44 @@ OpenAgno deduplica por `message_id`. Si ves replays:
 - revisa logs de duplicados
 - valida que el webhook esté respondiendo 200
 
+## WhatsApp Cloud API: el agente responde en logs pero el usuario no recibe nada
+
+Este caso es critico porque el run del agente puede terminar bien y aun asi
+fallar la entrega al usuario. En multi-tenant Cloud API, una respuesta completa
+debe mostrar toda esta cadena:
+
+```bash
+journalctl -u openagno --since "-10 min" --no-pager -o cat \
+  | rg "whatsapp-cloud|respuesta extraida|enviando respuesta|Meta acepto|send_text fallo|empty_response"
+```
+
+Ruta exitosa esperada:
+
+```text
+whatsapp-cloud: mensaje de ...
+whatsapp-cloud: ejecutando agente ...
+whatsapp-cloud: agente respondio en ...
+whatsapp-cloud: respuesta extraida type=RunOutput chars=...
+whatsapp-cloud: enviando respuesta ...
+whatsapp-cloud: Meta acepto respuesta ...
+```
+
+Si aparece `respuesta extraida` pero no aparece ni `Meta acepto` ni
+`send_text fallo`, el envio saliente quedo roto o cancelado y debe tratarse
+como regresion. Si aparece `Meta acepto` pero el usuario no recibe el mensaje,
+el runtime ya entrego el POST a Meta; revisa el estado del Phone Number ID,
+WABA, quality rating y webhooks de delivery en Meta.
+
+Confirma tambien la fila del canal:
+
+```sql
+select last_event_at, last_send_at, last_error
+from public.whatsapp_cloud_channels
+where tenant_id = '<tenant_uuid>';
+```
+
+En exito, `last_send_at` avanza y `last_error` queda `null`.
+
 ## WhatsApp responde `Sorry, there was an error processing your message` (o no responde nada)
 
 Ese texto lo devuelve la interfaz `Whatsapp` de Agno cuando captura una excepción al ejecutar el agente. La causa más frecuente es que el runtime tiene en memoria el workspace anterior al último `openagno init`/`openagno add` o a la edición manual de `.env` o `workspace/`. El proceso no releé los archivos automáticamente.

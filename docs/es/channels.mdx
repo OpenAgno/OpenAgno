@@ -58,6 +58,38 @@ El tenant pega esta URL y el Verify Token generado en Meta Developer Console &gt
 
 Si `CHANNEL_SECRETS_KEY` no esta definida, el webhook multi-tenant no se monta y el runtime sigue sirviendo el `/whatsapp/webhook` de un solo tenant desde Agno.
 
+### Invariante operativo de entrega
+
+Cuando `POST /whatsapp-cloud/{tenant_id}/webhook` recibe un mensaje y
+`agent.arun()` termina, el runtime debe hacer una de estas cosas:
+
+- registrar `Meta acepto respuesta ...` y avanzar `last_send_at`
+- registrar `send_text fallo ...` y escribir `last_error`
+- enviar un aviso seguro si el agente falla, expira o devuelve texto vacio
+
+Nunca debe existir un flujo donde aparezca `respuesta extraida` y luego no
+ocurra ni envio ni error. Para diagnosticar:
+
+```bash
+journalctl -u openagno --since "-10 min" --no-pager -o cat \
+  | rg "whatsapp-cloud|respuesta extraida|enviando respuesta|Meta acepto|send_text fallo|empty_response"
+```
+
+La ruta sana debe verse asi:
+
+```text
+whatsapp-cloud: mensaje de ...
+whatsapp-cloud: ejecutando agente ...
+whatsapp-cloud: agente respondio en ...
+whatsapp-cloud: respuesta extraida type=RunOutput chars=...
+whatsapp-cloud: enviando respuesta ...
+whatsapp-cloud: Meta acepto respuesta ...
+```
+
+El incidente del 3 de julio de 2026 se cerro validando mensajes consecutivos,
+consulta a Linear/issues y audio real con `last_send_at` actualizado y
+`last_error=null`.
+
 ## Desarrollo local sin dominio
 
 Durante desarrollo local normalmente necesitas un tunel publico para webhooks de WhatsApp, Slack o Telegram. En OpenAgno, la ruta practica esta documentada en [/es/whatsapp-tunnel](/es/whatsapp-tunnel).

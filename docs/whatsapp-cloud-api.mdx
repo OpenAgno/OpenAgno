@@ -124,6 +124,50 @@ The runtime writes to three timestamps in the same row as events come in:
 
 These fields surface in the Cloud dashboard without ever exposing the underlying tokens.
 
+### Delivery invariant
+
+For multi-tenant WhatsApp Cloud API, a completed agent run must always end in one of these observable outcomes:
+
+- `Meta acepto respuesta ...` appears in the runtime log and `last_send_at` advances.
+- `send_text fallo ...` appears in the runtime log and `last_error` is set.
+- the agent times out or raises, the runtime sends a safe error notice, and `last_error` records the agent failure.
+- the agent returns no extractable text, the runtime sends a safe empty-response notice, and `last_error=agent_error:empty_response`.
+
+There must never be a path where `agent.arun()` completes, the runtime logs `respuesta extraida`, and the webhook exits without either sending a WhatsApp message or writing a clear failure.
+
+The July 3, 2026 incident for the `test` tenant exposed two failure modes that this invariant covers:
+
+- `RunOutput.content` could be empty while useful assistant text lived in `messages`; extraction now prefers `get_content_as_string()` and then falls back through assistant messages and events.
+- the background task that ran the agent could be cancelled while awaiting the outbound Graph API POST; outbound sends now run in their own tracked task with a hard timeout and success/failure logging.
+
+Operator check:
+
+```bash
+journalctl -u openagno --since "-10 min" --no-pager -o cat \
+  | rg "whatsapp-cloud|respuesta extraida|enviando respuesta|Meta acepto|send_text fallo|empty_response"
+```
+
+Expected successful text flow:
+
+```text
+[tenant] whatsapp-cloud: mensaje de <wa_id>: <text> (tipo=text)
+[tenant] whatsapp-cloud: ejecutando agente para <wa_id>...
+[tenant] whatsapp-cloud: agente respondio en <seconds>s
+[tenant] whatsapp-cloud: respuesta extraida type=RunOutput chars=<n>
+[tenant] whatsapp-cloud: enviando respuesta a <wa_id> chars=<n>
+[tenant] whatsapp-cloud: Meta acepto respuesta a <wa_id>
+```
+
+Expected database state after success:
+
+```sql
+select last_event_at, last_send_at, last_error
+from public.whatsapp_cloud_channels
+where tenant_id = '<tenant_uuid>';
+```
+
+`last_send_at` must be newer than the incoming message time and `last_error` must be `null`.
+
 ## Security notes
 
 - Tokens never touch disk or logs. They live in the Supabase row and are only loaded into memory for the duration of a request.
@@ -136,9 +180,12 @@ For `text` messages, the body is sent directly to the tenant agent. For `image` 
 
 On April 27, 2026, production validation confirmed real WhatsApp Cloud API text and audio delivery for tenant `test-datatensei`: the OSS runtime loaded `workspaces/test-datatensei`, processed incoming `tipo=text` and `tipo=audio` events, sent replies through Graph API, and left `last_error=null` with `last_send_at` populated in `public.whatsapp_cloud_channels`.
 
+On July 3, 2026, production validation reconfirmed the hosted multi-tenant path for tenant `test`: consecutive text messages, a Linear/issues query, and an audio message all completed with `Meta acepto respuesta`, `last_send_at` advancing, and `last_error=null`.
+
 ## Troubleshooting
 
 - **Runtime starts but multi-tenant webhook returns 404** &mdash; OSS did not find `CHANNEL_SECRETS_KEY` in the environment. Check the startup log: you will see `WhatsApp Cloud API multi-tenant desactivado: falta CHANNEL_SECRETS_KEY`.
 - **Meta reports verification failed** &mdash; the Verify Token in Meta Developer Console does not match the value stored for that tenant, or `tenant_id` in the URL is wrong. Regenerate the token from `/onboarding/whatsapp-cloud` and paste it again.
 - **`401 invalid_signature` on every POST** &mdash; the App Secret in the customer form does not match the App Secret in Meta &gt; App &gt; Settings &gt; Basic. Correct the value in `/onboarding/whatsapp-cloud` and save again.
 - **`500 tenant_workspace_missing`** &mdash; the OSS cannot load the tenant's workspace from `TenantLoader`. This usually means the `tenants.runtime_slug` value in Cloud is not present on the OSS workspace store. Re-run workspace sync from the dashboard.
+- **The agent responds in logs but the user receives nothing** &mdash; this is a critical delivery break. Check for `respuesta extraida` followed by `enviando respuesta` and `Meta acepto`. If `respuesta extraida` appears without either `Meta acepto` or `send_text fallo`, treat it as a regression in the protected send task. If `Meta acepto` appears but the user still does not receive the message, the runtime has handed the message to Meta; inspect the returned Graph message id, the customer's phone/WABA status, and Meta delivery webhooks.

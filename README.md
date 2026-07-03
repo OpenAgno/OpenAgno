@@ -218,6 +218,8 @@ For WhatsApp Cloud API (the official Meta Graph API), the runtime supports two d
 
 The multi-tenant Cloud API webhook processes text, image, and audio payloads. Image payloads are passed to multimodal models when the tenant model supports images; audio payloads are passed to audio-capable models or transcribed with OpenAI Whisper when an OpenAI key is available. If neither path is configured, the runtime replies with an explicit audio capability message instead of silently dropping the event.
 
+Production incident validation on July 3, 2026 confirmed the multi-tenant webhook must be observable through the whole inbound-to-outbound path: after `agent.arun()` completes the runtime logs the extracted `RunOutput` text length, sends Graph API replies from a protected send task, logs `Meta acepto ...` on success, and advances `last_send_at`. If the agent returns no extractable text, the runtime sends a safe fallback message and writes `last_error=agent_error:empty_response`; it must never silently `continue` after a completed run.
+
 Operational validation on April 27, 2026 confirmed a real Meta webhook subscription and real inbound/outbound WhatsApp Cloud API traffic for tenant `test-datatensei`, including text and audio messages, with `last_error=null` and `last_send_at` set in `whatsapp_cloud_channels`. Do not commit the generated tenant workspace or any provider credentials used for that validation.
 
 An external control plane can also drive the `whatsapp.mode` field in the workspace config (`qr_link`, `cloud_api`, or `dual`) over the existing `/tenants/{id}/workspace` HTTP contract without adding new APIs on the runtime side.

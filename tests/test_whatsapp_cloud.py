@@ -14,13 +14,14 @@ import hmac
 import json
 import os
 from contextlib import contextmanager
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
 import pytest
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from fastapi.testclient import TestClient
 from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 from openagno.channels import whatsapp_cloud as wc
 
@@ -221,7 +222,10 @@ def test_extract_messages_filters_non_text():
 def _build_app(row: tuple | None, tenant_loader: Any | None = None):
 	app = FastAPI()
 	app.state.tenant_loader = tenant_loader
-	router = wc.create_router(get_tenant_loader=lambda: app.state.tenant_loader)
+	router = wc.create_router(
+		get_tenant_loader=lambda: app.state.tenant_loader,
+		process_messages_inline=True,
+	)
 	app.include_router(router)
 	return app
 
@@ -232,17 +236,18 @@ class _AgentResponse:
 
 
 class _FakeAgent:
-	def __init__(self):
+	def __init__(self, response: Any | None = None):
 		self.calls: list[tuple[str, dict[str, Any]]] = []
+		self.response = response if response is not None else _AgentResponse("respuesta del agente")
 
 	async def arun(self, text: str, **kwargs):
 		self.calls.append((text, kwargs))
-		return _AgentResponse("respuesta del agente")
+		return self.response
 
 
 class _FakeTenantLoader:
-	def __init__(self, model: dict[str, Any] | None = None):
-		self.agent = _FakeAgent()
+	def __init__(self, model: dict[str, Any] | None = None, response: Any | None = None):
+		self.agent = _FakeAgent(response=response)
 		self.model = model or {"provider": "openai", "id": "gpt-5-mini"}
 
 	def get_or_load(self, _slug: str):
@@ -316,6 +321,24 @@ def test_raw_provider_errors_are_detected_for_safe_reply():
 	assert "Canonical String" not in wc._safe_provider_error_reply()
 
 
+def test_extract_response_text_falls_back_to_assistant_message_when_content_empty():
+	response = SimpleNamespace(
+		content="",
+		messages=[
+			SimpleNamespace(role="user", content="hola"),
+			SimpleNamespace(role="assistant", content="respuesta desde messages"),
+		],
+	)
+
+	assert wc._extract_response_text(response) == "respuesta desde messages"
+
+
+def test_extract_response_text_empty_structured_response_returns_none():
+	response = SimpleNamespace(content="", messages=[], events=[])
+
+	assert wc._extract_response_text(response) is None
+
+
 def test_webhook_post_invalid_signature():
 	row = _build_row(app_secret="top_secret")
 	with (
@@ -371,17 +394,17 @@ def test_webhook_dedupes_meta_retries_of_same_message_id():
 		# Aislar el estado global de dedup para este test.
 		wc._processed_messages.clear()
 		app = _build_app(row, tenant_loader=loader)
-		client = TestClient(app)
-		first = client.post(
-			"/whatsapp-cloud/11111111-1111-1111-1111-111111111111/webhook",
-			content=body,
-			headers={"content-type": "application/json"},
-		)
-		second = client.post(
-			"/whatsapp-cloud/11111111-1111-1111-1111-111111111111/webhook",
-			content=body,
-			headers={"content-type": "application/json"},
-		)
+		with TestClient(app) as client:
+			first = client.post(
+				"/whatsapp-cloud/11111111-1111-1111-1111-111111111111/webhook",
+				content=body,
+				headers={"content-type": "application/json"},
+			)
+			second = client.post(
+				"/whatsapp-cloud/11111111-1111-1111-1111-111111111111/webhook",
+				content=body,
+				headers={"content-type": "application/json"},
+			)
 
 	assert first.status_code == 200
 	assert first.json()["queued"] == 1
@@ -408,14 +431,14 @@ def test_webhook_post_text_runs_tenant_agent_and_sends_reply():
 	):
 		wc._processed_messages.clear()
 		app = _build_app(row, tenant_loader=loader)
-		client = TestClient(app)
-		resp = client.post(
-			"/whatsapp-cloud/11111111-1111-1111-1111-111111111111/webhook",
-			content=_wa_body([
-				{"id": "m-text", "from": "5491111", "type": "text", "text": {"body": "hola"}},
-			]),
-			headers={"content-type": "application/json"},
-		)
+		with TestClient(app) as client:
+			resp = client.post(
+				"/whatsapp-cloud/11111111-1111-1111-1111-111111111111/webhook",
+				content=_wa_body([
+					{"id": "m-text", "from": "5491111", "type": "text", "text": {"body": "hola"}},
+				]),
+				headers={"content-type": "application/json"},
+			)
 
 	assert resp.status_code == 200
 	assert resp.json()["queued"] == 1
@@ -426,6 +449,45 @@ def test_webhook_post_text_runs_tenant_agent_and_sends_reply():
 		)
 	]
 	assert sent == [("5491111", "respuesta del agente")]
+
+
+def test_webhook_post_empty_agent_response_sends_safe_notice():
+	row = _build_row(app_secret=None, runtime_slug="tenant-api")
+	loader = _FakeTenantLoader(response=SimpleNamespace(content="", messages=[], events=[]))
+	sent: list[tuple[str, str]] = []
+	touches: list[tuple[str, str, str | None]] = []
+
+	async def _fake_send_text(_cfg, to: str, text: str):
+		sent.append((to, text))
+		return {"messages": [{"id": "wamid.sent"}]}
+
+	def _fake_touch(tenant_id: str, column: str, error: str | None = None):
+		touches.append((tenant_id, column, error))
+
+	with (
+		_patch_db(row),
+		patch.object(wc, "_touch_column", _fake_touch),
+		patch.object(wc, "send_text", _fake_send_text),
+	):
+		wc._processed_messages.clear()
+		app = _build_app(row, tenant_loader=loader)
+		with TestClient(app) as client:
+			resp = client.post(
+				"/whatsapp-cloud/11111111-1111-1111-1111-111111111111/webhook",
+				content=_wa_body([
+					{"id": "m-empty", "from": "5491111", "type": "text", "text": {"body": "hola"}},
+				]),
+				headers={"content-type": "application/json"},
+			)
+
+	assert resp.status_code == 200
+	assert sent == [("5491111", wc._empty_agent_reply())]
+	assert ("11111111-1111-1111-1111-111111111111", "last_send_at", None) in touches
+	assert (
+		"11111111-1111-1111-1111-111111111111",
+		"last_event_at",
+		"agent_error:empty_response",
+	) in touches
 
 
 def test_webhook_post_image_downloads_media_for_multimodal_agent():
@@ -446,19 +508,19 @@ def test_webhook_post_image_downloads_media_for_multimodal_agent():
 		patch.object(wc, "send_text", _fake_send_text),
 	):
 		app = _build_app(row, tenant_loader=loader)
-		client = TestClient(app)
-		resp = client.post(
-			"/whatsapp-cloud/11111111-1111-1111-1111-111111111111/webhook",
-			content=_wa_body([
-				{
-					"id": "m-image",
-					"from": "5491111",
-					"type": "image",
-					"image": {"id": "media-image", "mime_type": "image/jpeg"},
-				},
-			]),
-			headers={"content-type": "application/json"},
-		)
+		with TestClient(app) as client:
+			resp = client.post(
+				"/whatsapp-cloud/11111111-1111-1111-1111-111111111111/webhook",
+				content=_wa_body([
+					{
+						"id": "m-image",
+						"from": "5491111",
+						"type": "image",
+						"image": {"id": "media-image", "mime_type": "image/jpeg"},
+					},
+				]),
+				headers={"content-type": "application/json"},
+			)
 
 	assert resp.status_code == 200
 	text, kwargs = loader.agent.calls[0]
@@ -498,19 +560,19 @@ def test_webhook_post_audio_transcribes_when_model_has_no_audio_native():
 		patch.object(wc, "send_text", _fake_send_text),
 	):
 		app = _build_app(row, tenant_loader=loader)
-		client = TestClient(app)
-		resp = client.post(
-			"/whatsapp-cloud/11111111-1111-1111-1111-111111111111/webhook",
-			content=_wa_body([
-				{
-					"id": "m-audio",
-					"from": "5491111",
-					"type": "audio",
-					"audio": {"id": "media-audio", "mime_type": "audio/ogg"},
-				},
-			]),
-			headers={"content-type": "application/json"},
-		)
+		with TestClient(app) as client:
+			resp = client.post(
+				"/whatsapp-cloud/11111111-1111-1111-1111-111111111111/webhook",
+				content=_wa_body([
+					{
+						"id": "m-audio",
+						"from": "5491111",
+						"type": "audio",
+						"audio": {"id": "media-audio", "mime_type": "audio/ogg"},
+					},
+				]),
+				headers={"content-type": "application/json"},
+			)
 
 	assert resp.status_code == 200
 	assert loader.agent.calls[0][0] == "[Transcripcion de audio]: audio transcrito"

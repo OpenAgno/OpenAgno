@@ -345,14 +345,50 @@ def _extract_messages(payload: dict[str, Any]) -> list[dict[str, Any]]:
 def _extract_response_text(response: Any) -> str | None:
 	if response is None:
 		return None
-	if hasattr(response, "content") and response.content is not None:
-		return str(response.content)
+	if isinstance(response, str):
+		return response
+
+	content = getattr(response, "content", None)
+	if content is not None:
+		if hasattr(response, "get_content_as_string"):
+			try:
+				text = response.get_content_as_string()
+				if isinstance(text, str) and text.strip() and text.strip() != "null":
+					return text
+			except Exception as exc:  # noqa: BLE001 - fallback below keeps webhook resilient
+				logger.warning(
+					f"whatsapp-cloud: no pude serializar content de {type(response).__name__}: "
+					f"{type(exc).__name__}"
+				)
+		if hasattr(content, "model_dump_json"):
+			text = content.model_dump_json(exclude_none=True)
+			if text.strip():
+				return text
+		text = str(content)
+		if text.strip():
+			return text
+
 	if hasattr(response, "messages") and response.messages:
 		for msg in reversed(response.messages):
 			role = getattr(msg, "role", "")
 			content = getattr(msg, "content", None)
 			if role == "assistant" and content:
-				return str(content)
+				if hasattr(msg, "get_content_string"):
+					text = msg.get_content_string()
+				else:
+					text = str(content)
+				if text.strip():
+					return text
+	if hasattr(response, "events") and response.events:
+		for event in reversed(response.events):
+			content = getattr(event, "content", None)
+			if content is None:
+				continue
+			text = str(content)
+			if text.strip():
+				return text
+	if any(hasattr(response, attr) for attr in ("content", "messages", "events")):
+		return None
 	return str(response)
 
 
@@ -374,6 +410,13 @@ def _safe_provider_error_reply() -> str:
 	)
 
 
+def _empty_agent_reply() -> str:
+	return (
+		"Recibi tu mensaje, pero el agente termino sin generar una respuesta de texto. "
+		"Ya quedo registrado para revision; intenta de nuevo en unos minutos."
+	)
+
+
 # Deduplicacion de mensajes entrantes. Meta reintenta la entrega del webhook si
 # no recibe HTTP 200 en pocos segundos; como el agente puede tardar decenas de
 # segundos, esos reintentos entregan el MISMO mensaje (mismo `id`) y, sin este
@@ -391,6 +434,7 @@ _background_tasks: set[Any] = set()
 # Limite duro por run del agente. Si el modelo/las tools se cuelgan, el usuario
 # recibe un aviso en vez de silencio infinito.
 _AGENT_RUN_TIMEOUT_SECONDS = int(os.getenv("WHATSAPP_AGENT_TIMEOUT_SECONDS", "300"))
+_GRAPH_SEND_TIMEOUT_SECONDS = int(os.getenv("WHATSAPP_GRAPH_SEND_TIMEOUT_SECONDS", "30"))
 
 # Un solo run del agente por tenant a la vez. Mensajes rapidos consecutivos
 # creaban runs concurrentes sobre el MISMO objeto Agent y la MISMA sesion MCP
@@ -415,6 +459,88 @@ def _agent_timeout_reply() -> str:
 	)
 
 
+async def _send_text_with_audit(
+	cfg: WhatsAppCloudConfig,
+	tenant_id: str,
+	runtime_slug: str,
+	to: str,
+	text: str,
+	*,
+	purpose: str,
+) -> dict[str, Any]:
+	logger.info(
+		f"[{runtime_slug}] whatsapp-cloud: enviando {purpose} a {to} "
+		f"chars={len(text)} timeout={_GRAPH_SEND_TIMEOUT_SECONDS}s"
+	)
+	result = await asyncio.wait_for(
+		send_text(cfg, to, text),
+		timeout=_GRAPH_SEND_TIMEOUT_SECONDS,
+	)
+	message_id = None
+	try:
+		messages = result.get("messages") if isinstance(result, dict) else None
+		if isinstance(messages, list) and messages:
+			message_id = messages[0].get("id") if isinstance(messages[0], dict) else None
+	except Exception:  # noqa: BLE001 - el envio ya fue aceptado; el id es solo telemetria
+		message_id = None
+	logger.info(
+		f"[{runtime_slug}] whatsapp-cloud: Meta acepto {purpose} a {to} "
+		f"message_id={message_id or 'unknown'}"
+	)
+	_touch_column(tenant_id, "last_send_at")
+	return result
+
+
+def _track_background_task(task: asyncio.Task, runtime_slug: str, description: str) -> None:
+	_background_tasks.add(task)
+
+	def _on_done(done_task: asyncio.Task) -> None:
+		_background_tasks.discard(done_task)
+		try:
+			exc = done_task.exception()
+		except asyncio.CancelledError:
+			logger.error(f"[{runtime_slug}] whatsapp-cloud: {description} cancelada")
+			return
+		if exc is not None:
+			logger.error(
+				f"[{runtime_slug}] whatsapp-cloud: {description} fallo: {type(exc).__name__}: {exc}"
+			)
+
+	task.add_done_callback(_on_done)
+
+
+def _schedule_send_text_with_audit(
+	cfg: WhatsAppCloudConfig,
+	tenant_id: str,
+	runtime_slug: str,
+	to: str,
+	text: str,
+	*,
+	purpose: str,
+	event_error: str | None,
+) -> None:
+	async def _run_send() -> None:
+		try:
+			await _send_text_with_audit(
+				cfg,
+				tenant_id,
+				runtime_slug,
+				to,
+				text,
+				purpose=purpose,
+			)
+			_touch_column(tenant_id, "last_event_at", error=event_error)
+		except asyncio.CancelledError:
+			_touch_column(tenant_id, "last_event_at", error="send_cancelled")
+			raise
+		except Exception as exc:  # noqa: BLE001
+			logger.error(f"[{runtime_slug}] whatsapp-cloud: send_text fallo a {to}: {exc}")
+			_touch_column(tenant_id, "last_event_at", error=f"send_failed:{exc}")
+
+	task = asyncio.create_task(_run_send())
+	_track_background_task(task, runtime_slug, f"envio {purpose}")
+
+
 def _claim_message(msg_id: str) -> bool:
 	"""Marca un mensaje como en proceso. Devuelve True si es nuevo (hay que
 	procesarlo), False si ya fue visto dentro del TTL (reintento a descartar).
@@ -435,7 +561,7 @@ def _claim_message(msg_id: str) -> bool:
 		return True
 
 
-def create_router(*, get_tenant_loader: Any) -> APIRouter:
+def create_router(*, get_tenant_loader: Any, process_messages_inline: bool = False) -> APIRouter:
 	"""Construye el router `/whatsapp-cloud/*` inyectando el TenantLoader.
 
 	`get_tenant_loader` es un callable `() -> TenantLoader` para no acoplarnos
@@ -484,6 +610,33 @@ def create_router(*, get_tenant_loader: Any) -> APIRouter:
 		tenant_model_cfg = bundle.get("config", {}).get("model", {}) or {}
 		tenant_caps = get_model_capabilities(tenant_model_cfg.get("id"))
 		last_send_error: str | None = None
+
+		async def _dispatch_send(to: str, text: str, *, purpose: str, event_error: str | None) -> None:
+			if process_messages_inline:
+				try:
+					await _send_text_with_audit(
+						cfg,
+						tenant_id,
+						runtime_slug,
+						to,
+						text,
+						purpose=purpose,
+					)
+					_touch_column(tenant_id, "last_event_at", error=event_error)
+				except Exception as exc:  # noqa: BLE001
+					logger.error(f"[{runtime_slug}] whatsapp-cloud: send_text fallo a {to}: {exc}")
+					_touch_column(tenant_id, "last_event_at", error=f"send_failed:{exc}")
+				return
+
+			_schedule_send_text_with_audit(
+				cfg,
+				tenant_id,
+				runtime_slug,
+				to,
+				text,
+				purpose=purpose,
+				event_error=event_error,
+			)
 
 		for message in messages:
 			from_jid = message["from"]
@@ -560,33 +713,36 @@ def create_router(*, get_tenant_loader: Any) -> APIRouter:
 					f"[{runtime_slug}] whatsapp-cloud: agente respondio en {time.monotonic() - started:.1f}s"
 				)
 				reply_text = (_extract_response_text(result) or "").strip()
+				logger.info(
+					f"[{runtime_slug}] whatsapp-cloud: respuesta extraida "
+					f"type={type(result).__name__} chars={len(reply_text)}"
+				)
 			except asyncio.TimeoutError:
 				logger.error(
 					f"[{runtime_slug}] whatsapp-cloud: agente supero el timeout de "
 					f"{_AGENT_RUN_TIMEOUT_SECONDS}s; se avisa al usuario"
 				)
 				last_send_error = "agent_error:timeout"
-				try:
-					await send_text(cfg, from_jid, _agent_timeout_reply())
-					_touch_column(tenant_id, "last_send_at")
-				except Exception as send_exc:  # noqa: BLE001
-					logger.error(
-						f"[{runtime_slug}] whatsapp-cloud: fallo el aviso de timeout a {from_jid}: {send_exc}"
-					)
+				await _dispatch_send(
+					from_jid,
+					_agent_timeout_reply(),
+					purpose="aviso_timeout",
+					event_error=last_send_error,
+				)
 				continue
 			except Exception as exc:  # noqa: BLE001
 				logger.error(f"[{runtime_slug}] whatsapp-cloud: agente fallo: {exc}")
 				last_send_error = f"agent_error:{exc}"
 				# Nunca dejar al usuario en silencio: enviar una respuesta segura
 				# (sin detalles internos) para que sepa que algo fallo.
-				try:
-					await send_text(cfg, from_jid, _safe_provider_error_reply())
-					_touch_column(tenant_id, "last_send_at")
-				except Exception as send_exc:  # noqa: BLE001
-					logger.error(
-						f"[{runtime_slug}] whatsapp-cloud: fallo el aviso de error a {from_jid}: {send_exc}"
-					)
+				await _dispatch_send(
+					from_jid,
+					_safe_provider_error_reply(),
+					purpose="aviso_error",
+					event_error=last_send_error,
+				)
 				continue
+
 			if reply_text and _is_raw_provider_error(reply_text):
 				logger.error(
 					f"[{runtime_slug}] whatsapp-cloud: proveedor devolvio error crudo; se envia respuesta segura"
@@ -594,17 +750,18 @@ def create_router(*, get_tenant_loader: Any) -> APIRouter:
 				last_send_error = "agent_error:model_provider_error"
 				reply_text = _safe_provider_error_reply()
 			if not reply_text:
-				continue
-			try:
-				await send_text(cfg, from_jid, reply_text)
-				_touch_column(tenant_id, "last_send_at")
-			except Exception as exc:  # noqa: BLE001
 				logger.error(
-					f"[{runtime_slug}] whatsapp-cloud: send_text fallo a {from_jid}: {exc}"
+					f"[{runtime_slug}] whatsapp-cloud: agente termino sin texto extraible; "
+					f"se envia aviso seguro a {from_jid}"
 				)
-				last_send_error = f"send_failed:{exc}"
-
-		_touch_column(tenant_id, "last_event_at", error=last_send_error)
+				last_send_error = "agent_error:empty_response"
+				reply_text = _empty_agent_reply()
+			await _dispatch_send(
+				from_jid,
+				reply_text,
+				purpose="respuesta",
+				event_error=last_send_error,
+			)
 
 	@router.post("/whatsapp-cloud/{tenant_id}/webhook")
 	async def receive_webhook(tenant_id: str, request: Request):
@@ -646,6 +803,15 @@ def create_router(*, get_tenant_loader: Any) -> APIRouter:
 			)
 
 		if fresh:
+			if process_messages_inline:
+				await _process_messages(cfg, tenant_id, fresh)
+				return {
+					"status": "accepted",
+					"received": len(messages),
+					"queued": len(fresh),
+					"duplicates": duplicates,
+				}
+
 			# Responder 200 de inmediato y procesar en un task raiz del event loop,
 			# desacoplado del ciclo de la request. No usamos BackgroundTasks de
 			# Starlette porque corre dentro de los task groups/cancel scopes de los
@@ -653,7 +819,23 @@ def create_router(*, get_tenant_loader: Any) -> APIRouter:
 			# cancel scope" al iniciarse ahi.
 			task = asyncio.create_task(_process_messages(cfg, tenant_id, fresh))
 			_background_tasks.add(task)
-			task.add_done_callback(_background_tasks.discard)
+
+			def _on_done(done_task: asyncio.Task) -> None:
+				_background_tasks.discard(done_task)
+				try:
+					exc = done_task.exception()
+				except asyncio.CancelledError:
+					logger.error(
+						f"[{normalize_tenant_id(cfg.runtime_slug)}] whatsapp-cloud: task background cancelada"
+					)
+					return
+				if exc is not None:
+					logger.error(
+						f"[{normalize_tenant_id(cfg.runtime_slug)}] whatsapp-cloud: "
+						f"task background fallo: {type(exc).__name__}: {exc}"
+					)
+
+			task.add_done_callback(_on_done)
 
 		return {
 			"status": "accepted",
