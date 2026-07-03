@@ -388,6 +388,32 @@ _processed_messages_lock = threading.Lock()
 # recolector de basura no los cancele a mitad de ejecucion.
 _background_tasks: set[Any] = set()
 
+# Limite duro por run del agente. Si el modelo/las tools se cuelgan, el usuario
+# recibe un aviso en vez de silencio infinito.
+_AGENT_RUN_TIMEOUT_SECONDS = int(os.getenv("WHATSAPP_AGENT_TIMEOUT_SECONDS", "300"))
+
+# Un solo run del agente por tenant a la vez. Mensajes rapidos consecutivos
+# creaban runs concurrentes sobre el MISMO objeto Agent y la MISMA sesion MCP
+# (con refresh_connection reconectando en paralelo), lo que dejaba runs
+# colgados sin error. Serializar por tenant hace el comportamiento predecible;
+# los mensajes se atienden en orden de llegada.
+_tenant_run_locks: dict[str, asyncio.Lock] = {}
+
+
+def _get_tenant_run_lock(runtime_slug: str) -> asyncio.Lock:
+	lock = _tenant_run_locks.get(runtime_slug)
+	if lock is None:
+		lock = asyncio.Lock()
+		_tenant_run_locks[runtime_slug] = lock
+	return lock
+
+
+def _agent_timeout_reply() -> str:
+	return (
+		"Tu solicitud esta tardando mas de lo esperado y la corte para no dejarte "
+		"esperando. Intenta de nuevo con una consulta mas breve o en unos minutos."
+	)
+
 
 def _claim_message(msg_id: str) -> bool:
 	"""Marca un mensaje como en proceso. Devuelve True si es nuevo (hay que
@@ -523,8 +549,31 @@ def create_router(*, get_tenant_loader: Any) -> APIRouter:
 							"Cambia a un modelo multimodal desde el dashboard.]"
 						)
 
-				result = await agent.arun(text, **arun_kwargs)
+				logger.info(f"[{runtime_slug}] whatsapp-cloud: ejecutando agente para {from_jid}...")
+				started = time.monotonic()
+				async with _get_tenant_run_lock(runtime_slug):
+					result = await asyncio.wait_for(
+						agent.arun(text, **arun_kwargs),
+						timeout=_AGENT_RUN_TIMEOUT_SECONDS,
+					)
+				logger.info(
+					f"[{runtime_slug}] whatsapp-cloud: agente respondio en {time.monotonic() - started:.1f}s"
+				)
 				reply_text = (_extract_response_text(result) or "").strip()
+			except asyncio.TimeoutError:
+				logger.error(
+					f"[{runtime_slug}] whatsapp-cloud: agente supero el timeout de "
+					f"{_AGENT_RUN_TIMEOUT_SECONDS}s; se avisa al usuario"
+				)
+				last_send_error = "agent_error:timeout"
+				try:
+					await send_text(cfg, from_jid, _agent_timeout_reply())
+					_touch_column(tenant_id, "last_send_at")
+				except Exception as send_exc:  # noqa: BLE001
+					logger.error(
+						f"[{runtime_slug}] whatsapp-cloud: fallo el aviso de timeout a {from_jid}: {send_exc}"
+					)
+				continue
 			except Exception as exc:  # noqa: BLE001
 				logger.error(f"[{runtime_slug}] whatsapp-cloud: agente fallo: {exc}")
 				last_send_error = f"agent_error:{exc}"
