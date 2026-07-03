@@ -1,0 +1,167 @@
+---
+title: WhatsApp Cloud delivery incident, July 3 2026
+description: Postmortem and operator runbook for the multi-tenant WhatsApp Cloud API delivery break.
+---
+
+## Summary
+
+On July 3, 2026, the hosted multi-tenant WhatsApp Cloud API path for tenant
+`test` received inbound WhatsApp messages and completed `agent.arun()`, but the
+operator did not receive replies on the real WhatsApp account.
+
+The incident was severe because the agent execution path looked healthy while
+the user-facing delivery path failed. The runtime logged `agente respondio`,
+but `last_send_at` in `public.whatsapp_cloud_channels` stayed stale and the
+user saw silence.
+
+## Impact
+
+- Affected surface: `POST /whatsapp-cloud/{tenant_id}/webhook`.
+- Affected channel: multi-tenant WhatsApp Cloud API.
+- Affected behavior: inbound messages could run the tenant agent but fail to
+  deliver the final reply.
+- Customer-visible symptom: no WhatsApp response after sending a message.
+- Operator-visible symptom: `last_send_at` did not advance, and before the fix
+  there was no reliable success/failure log around the outbound Graph API POST.
+
+## Root causes
+
+Two independent gaps were found.
+
+1. Response extraction could produce an empty string.
+
+   The webhook used `_extract_response_text(result)` after `agent.arun()`. If
+   `RunOutput.content` was empty while useful assistant text lived in
+   `RunOutput.messages`, the extractor returned an empty value and the caller
+   could skip sending.
+
+2. The outbound send was vulnerable to task cancellation.
+
+   After response extraction was fixed, production logs showed:
+
+   ```text
+   whatsapp-cloud: respuesta extraida type=RunOutput chars=...
+   whatsapp-cloud: enviando respuesta ...
+   whatsapp-cloud: task background cancelada
+   ```
+
+   The task that ran the agent could be cancelled while awaiting the outbound
+   Graph API POST, so Meta never accepted the message and `last_send_at` did
+   not move.
+
+## Fix
+
+The runtime now enforces a delivery invariant for multi-tenant WhatsApp Cloud
+API:
+
+- after `agent.arun()` completes, the runtime logs the extracted response type
+  and character count
+- response extraction uses `get_content_as_string()` when available and falls
+  back through assistant `messages` and response `events`
+- an empty extracted response sends a safe fallback message and writes
+  `last_error=agent_error:empty_response`
+- outbound sends run in their own tracked task with a hard timeout
+- successful sends log `Meta acepto ...` and update `last_send_at`
+- failed sends log `send_text fallo ...` and update `last_error`
+
+The relevant implementation lives in
+`openagno/channels/whatsapp_cloud.py`.
+
+## Validation
+
+Validated on July 3, 2026 against the real hosted runtime:
+
+- consecutive text messages completed with `Meta acepto respuesta`
+- a Linear/issues query completed with `Meta acepto respuesta`
+- an audio message completed with `Meta acepto respuesta`
+- `last_send_at` advanced after successful sends
+- `last_error` remained `null`
+
+Local validation:
+
+```bash
+pytest -q
+ruff check openagno/channels/whatsapp_cloud.py tests/test_whatsapp_cloud.py
+cd docs && npm run validate
+```
+
+Note: `ruff check .` was blocked in this workspace by unrelated untracked
+scratch scripts in the repository root. Those files were not part of the fix
+and were not committed.
+
+## Operator runbook
+
+When a WhatsApp Cloud API customer reports no response, inspect the complete
+inbound-to-outbound chain:
+
+```bash
+journalctl -u openagno --since "-10 min" --no-pager -o cat \
+  | rg "whatsapp-cloud|respuesta extraida|enviando respuesta|Meta acepto|send_text fallo|empty_response"
+```
+
+Healthy flow:
+
+```text
+[tenant] whatsapp-cloud: mensaje de <wa_id>: <text> (tipo=text)
+[tenant] whatsapp-cloud: ejecutando agente para <wa_id>...
+[tenant] whatsapp-cloud: agente respondio en <seconds>s
+[tenant] whatsapp-cloud: respuesta extraida type=RunOutput chars=<n>
+[tenant] whatsapp-cloud: enviando respuesta a <wa_id> chars=<n>
+[tenant] whatsapp-cloud: Meta acepto respuesta a <wa_id>
+```
+
+Database check:
+
+```sql
+select last_event_at, last_send_at, last_error
+from public.whatsapp_cloud_channels
+where tenant_id = '<tenant_uuid>';
+```
+
+Expected state after success:
+
+- `last_event_at` advances
+- `last_send_at` advances
+- `last_error` is `null`
+
+Escalation rules:
+
+- If `respuesta extraida` appears without `Meta acepto` or `send_text fallo`,
+  treat it as a runtime regression.
+- If `send_text fallo` appears, inspect the Graph API status and tenant channel
+  credentials without logging secrets.
+- If `Meta acepto` appears but the user still does not receive the message,
+  the runtime handed the message to Meta. Inspect Meta delivery webhooks,
+  Phone Number ID status, WABA status, and quality limits.
+
+## Linear update template
+
+Use this content when closing the corresponding Linear issue:
+
+```text
+Resolved and deployed.
+
+Root cause:
+- RunOutput extraction could return empty text even when assistant messages
+  contained the response.
+- The outbound Graph API send could be cancelled while the background agent
+  task was awaiting Meta.
+
+Fix:
+- Hardened _extract_response_text() with get_content_as_string(), assistant
+  messages, and event fallbacks.
+- Removed silent empty-response path; users now receive a safe fallback and
+  last_error records agent_error:empty_response.
+- Moved Graph API sends into tracked send tasks with timeout, success logs,
+  failure logs, and last_send_at/last_error audit updates.
+- Added regression tests for empty response extraction and safe fallback.
+- Documented the delivery invariant and operator runbook.
+
+Validation:
+- pytest -q passed.
+- ruff passed on touched Python files.
+- docs validation passed with mintlify validate.
+- Production runtime accepted consecutive text messages, a Linear/issues query,
+  and an audio message through Meta; last_send_at advanced and last_error
+  stayed null.
+```
